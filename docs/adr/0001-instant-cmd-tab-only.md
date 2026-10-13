@@ -19,5 +19,6 @@ macOS 26.5: with an accessibility lookup added, 3-4 of 8 Cmd+Tab switches still 
 ## Consequences
 
 - Cmd+Tab switches in ~20-50 ms. Other ways of changing spaces keep the macOS animation.
-- An app with no remembered window (for example Finder before its first activation) still slides once.
+- If an app reports no focused window (Finder does this while inactive), the app uses its front window from the window list.
+- An app with no window on any space (for example Finder with all windows closed) still slides.
 - Uses two private APIs: `CGSCopySpacesForWindows` and `_AXUIElementGetWindow`.

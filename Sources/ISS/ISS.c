@@ -879,12 +879,8 @@ bool iss_consume_cmd_tab(void) {
     return recent;
 }
 
-bool iss_switch_to_window_space(uint32_t windowID) {
-    if (&CGSCopySpacesForWindows == NULL || !cgs_symbols_available()) {
-        return false;
-    }
-    CGSConnectionID connection = CGSMainConnectionID();
-
+// Returns the space that holds the window, or 0 if the window is on no space
+static CGSSpaceID space_for_window(CGSConnectionID connection, uint32_t windowID) {
     CFNumberRef windowNum = CFNumberCreate(NULL, kCFNumberSInt32Type, &windowID);
     CFArrayRef windowIDs = CFArrayCreate(NULL, (const void **)&windowNum, 1, &kCFTypeArrayCallBacks);
     CFRelease(windowNum);
@@ -898,6 +894,49 @@ bool iss_switch_to_window_space(uint32_t windowID) {
     if (windowSpaces) {
         CFRelease(windowSpaces);
     }
+    return windowSpace;
+}
+
+uint32_t iss_front_window_for_pid(pid_t pid) {
+    if (&CGSCopySpacesForWindows == NULL || !cgs_symbols_available()) {
+        return 0;
+    }
+    CFArrayRef windows = CGWindowListCopyWindowInfo(
+        kCGWindowListOptionAll | kCGWindowListExcludeDesktopElements, kCGNullWindowID);
+    if (!windows) {
+        return 0;
+    }
+    CGSConnectionID connection = CGSMainConnectionID();
+    uint32_t frontWindow = 0;
+    // The list goes from front to back. Skip helper windows that are on no space.
+    for (CFIndex i = 0; i < CFArrayGetCount(windows) && frontWindow == 0; i++) {
+        CFDictionaryRef window = (CFDictionaryRef)CFArrayGetValueAtIndex(windows, i);
+        CFNumberRef ownerNum = (CFNumberRef)CFDictionaryGetValue(window, kCGWindowOwnerPID);
+        CFNumberRef layerNum = (CFNumberRef)CFDictionaryGetValue(window, kCGWindowLayer);
+        CFNumberRef windowNum = (CFNumberRef)CFDictionaryGetValue(window, kCGWindowNumber);
+        int32_t owner = 0;
+        int32_t layer = -1;
+        uint32_t windowID = 0;
+        if (!ownerNum || !layerNum || !windowNum ||
+            !CFNumberGetValue(ownerNum, kCFNumberSInt32Type, &owner) ||
+            !CFNumberGetValue(layerNum, kCFNumberSInt32Type, &layer) ||
+            !CFNumberGetValue(windowNum, kCFNumberSInt32Type, &windowID)) {
+            continue;
+        }
+        if (owner == pid && layer == 0 && space_for_window(connection, windowID) != 0) {
+            frontWindow = windowID;
+        }
+    }
+    CFRelease(windows);
+    return frontWindow;
+}
+
+bool iss_switch_to_window_space(uint32_t windowID) {
+    if (&CGSCopySpacesForWindows == NULL || !cgs_symbols_available()) {
+        return false;
+    }
+    CGSConnectionID connection = CGSMainConnectionID();
+    CGSSpaceID windowSpace = space_for_window(connection, windowID);
 
     ISSSpaceInfo info;
     if (windowSpace == 0 || !iss_get_space_info(&info)) {

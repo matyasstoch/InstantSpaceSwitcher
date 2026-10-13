@@ -436,9 +436,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
       {
         _ = _AXUIElementGetWindow(window as! AXUIElement, &windowID)
       }
-      guard windowID != 0 else { return }
+      // Finder reports no focused window while inactive. Then use its front window,
+      // but only if no window is saved for the app yet.
+      let frontWindowID = windowID == 0 ? iss_front_window_for_pid(pid) : 0
       Task { @MainActor [weak self] in
-        self?.focusedWindows[pid] = windowID
+        guard let self else { return }
+        if windowID != 0 {
+          self.focusedWindows[pid] = windowID
+        } else if self.focusedWindows[pid] == nil, frontWindowID != 0 {
+          self.focusedWindows[pid] = frontWindowID
+        }
       }
     }
   }

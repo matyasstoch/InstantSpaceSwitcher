@@ -3,6 +3,7 @@
 
 #include <stdbool.h>
 #include <CoreFoundation/CoreFoundation.h>
+#include <sys/types.h>
 
 /** @brief Initialize resources
  * @return true on success, false on failure
@@ -129,5 +130,11 @@ bool iss_consume_cmd_tab(void);
  * @return true if a switch was started; false if the window is on the current space, on another display, or unknown
  */
 bool iss_switch_to_window_space(uint32_t windowID);
+
+/** @brief Returns the app's frontmost normal window that is on a space, or 0
+ *
+ * Slow (scans every window). Use it off the main thread.
+ */
+uint32_t iss_front_window_for_pid(pid_t pid);
 
 #endif /* _ISS_H */
