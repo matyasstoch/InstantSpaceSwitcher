@@ -3,6 +3,10 @@ import ApplicationServices
 import Combine
 import ISS
 
+// Private API. It gives the window server ID of an accessibility window.
+@_silgen_name("_AXUIElementGetWindow")
+private func _AXUIElementGetWindow(_ element: AXUIElement, _ windowID: UnsafeMutablePointer<CGWindowID>) -> AXError
+
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
   private let menuBarController = MenuBarController()
@@ -13,13 +17,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
   private var cancellables = Set<AnyCancellable>()
   private var spaceChangeObserver: Any?
   private var appActivationObserver: Any?
-  // Set to true briefly after any space change (swipe, our hotkeys). Prevents
-  // the didActivateApplicationNotification handler from incorrectly firing
-  // during non-CMD+TAB transitions.
-  private var recentSpaceChange = false
-  private var recentSpaceChangeTimer: DispatchWorkItem?
+  private var appDeactivationObserver: Any?
+  // Last focused window of each app, by pid. macOS returns to this window on Cmd+Tab.
+  private var focusedWindows: [pid_t: CGWindowID] = [:]
 
   func applicationWillFinishLaunching(_ notification: Notification) {
+    UserDefaults.standard.register(defaults: ["hideMenuBarIcon": true])
     NSAppleEventManager.shared().setEventHandler(
       self,
       andSelector: #selector(handleReopen),
@@ -71,6 +74,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     observeSpaceChanges()
     observeAppActivation()
     refreshSpaceInfo()
+
+    for app in NSWorkspace.shared.runningApplications where app.activationPolicy == .regular {
+      rememberFocusedWindow(of: app)
+    }
   }
 
   func applicationWillTerminate(_ notification: Notification) {
@@ -321,17 +328,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
   }
 
-  private func markRecentSpaceChange() {
-    recentSpaceChange = true
-    recentSpaceChangeTimer?.cancel()
-    let work = DispatchWorkItem { [weak self] in self?.recentSpaceChange = false }
-    recentSpaceChangeTimer = work
-    DispatchQueue.main.asyncAfter(deadline: .now() + 0.4, execute: work)
-  }
-
   private func performSpaceSwitch(_ direction: ISSDirection) {
-    // Mark early so the activation handler doesn't fire for the resulting app switch.
-    markRecentSpaceChange()
     if !iss_switch(direction) {
       NSSound.beep()
       return
@@ -340,7 +337,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
   }
 
   private func performSpaceSwitchToIndex(_ index: UInt32) {
-    markRecentSpaceChange()
     if !iss_switch_to_index(index) {
       NSSound.beep()
       return
@@ -380,9 +376,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     ) { [weak self] _ in
       Task { @MainActor [weak self] in
         guard let self else { return }
-        // A space change happened (swipe or our gesture). Suppress the activation
-        // handler so it doesn't fight the new active space.
-        self.markRecentSpaceChange()
         self.refreshSpaceInfo()
         iss_reset_predictions()
         self.menuBarController.scheduleRefresh(after: 0.2)
@@ -405,38 +398,48 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
       queue: .main
     ) { [weak self] notification in
       MainActor.assumeIsolated {
-      guard let self, !self.recentSpaceChange else {
-        // A space change is already in progress (swipe or our hotkey). The
-        // activation here is a side-effect of that transition, not CMD+TAB.
-        Task { @MainActor [weak self] in
-          self?.menuBarController.scheduleRefresh(after: 0.1)
+        // Only Cmd+Tab gets the instant switch. Dock clicks, swipes, etc. keep the native animation.
+        // This must run before macOS starts its own animated switch (~20 ms), so it only does a lookup.
+        guard let self,
+          let app = notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication
+        else { return }
+        if iss_consume_cmd_tab(), let windowID = self.focusedWindows[app.processIdentifier] {
+          _ = iss_switch_to_window_space(windowID)
         }
-        return
+        // Finder only reports its focused window while active, so also remember it here
+        self.rememberFocusedWindow(of: app)
+        self.menuBarController.scheduleRefresh(after: 0.1)
       }
-      // CMD+TAB scenario: the app became active before any space change fired.
-      // Read current space now (before macOS starts its animated transition).
-      var currentInfo = ISSSpaceInfo()
-      guard iss_get_menubar_space_info(&currentInfo) else {
-        Task { @MainActor [weak self] in
-          self?.menuBarController.scheduleRefresh(after: 0.1)
+    }
+    appDeactivationObserver = NSWorkspace.shared.notificationCenter.addObserver(
+      forName: NSWorkspace.didDeactivateApplicationNotification,
+      object: nil,
+      queue: .main
+    ) { [weak self] notification in
+      MainActor.assumeIsolated {
+        if let app = notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication {
+          self?.rememberFocusedWindow(of: app)
         }
-        return
       }
-      if let app = notification.userInfo?[NSWorkspace.applicationUserInfoKey]
-        as? NSRunningApplication
+    }
+  }
+
+  // Accessibility calls can take tens of ms (first call, busy app), so run them off the main thread.
+  private func rememberFocusedWindow(of app: NSRunningApplication) {
+    let pid = app.processIdentifier
+    DispatchQueue.global(qos: .userInitiated).async {
+      var window: CFTypeRef?
+      var windowID: CGWindowID = 0
+      let element = AXUIElementCreateApplication(pid)
+      if AXUIElementCopyAttributeValue(element, kAXFocusedWindowAttribute as CFString, &window) == .success,
+        let window, CFGetTypeID(window) == AXUIElementGetTypeID()
       {
-        var targetIndex: UInt32 = 0
-        if iss_get_space_index_for_pid(
-          app.processIdentifier, currentInfo.currentIndex, &targetIndex)
-        {
-          // App has no window on the current space — switch to where it lives.
-          _ = iss_switch_to_index(targetIndex)
-        }
+        _ = _AXUIElementGetWindow(window as! AXUIElement, &windowID)
       }
+      guard windowID != 0 else { return }
       Task { @MainActor [weak self] in
-        self?.menuBarController.scheduleRefresh(after: 0.1)
+        self?.focusedWindows[pid] = windowID
       }
-      } // MainActor.assumeIsolated
     }
   }
 
@@ -444,6 +447,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     if let observer = appActivationObserver {
       NSWorkspace.shared.notificationCenter.removeObserver(observer)
       appActivationObserver = nil
+    }
+    if let observer = appDeactivationObserver {
+      NSWorkspace.shared.notificationCenter.removeObserver(observer)
+      appDeactivationObserver = nil
     }
   }
 
@@ -465,7 +472,6 @@ extension AppDelegate: MenuBarControllerDelegate {
   func menuBarController(
     _ controller: MenuBarController, didRequestSwitchToSpaceAtIndex index: UInt32
   ) {
-    markRecentSpaceChange()
     if !iss_switch_to_index(index) {
       NSSound.beep()
     }

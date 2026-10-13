@@ -407,7 +407,8 @@ final class HotkeyStore: ObservableObject {
 
     for identifier in HotkeyIdentifier.allCases {
       let key = "enabled.\(identifier.rawValue)"
-      enabledStates[identifier] = defaults.object(forKey: key) as? Bool ?? true
+      // Off by default: this fork only makes Cmd+Tab instant
+      enabledStates[identifier] = defaults.object(forKey: key) as? Bool ?? false
     }
   }
 
@@ -559,7 +560,7 @@ final class HotkeyStore: ObservableObject {
   }
 
   func isEnabled(_ identifier: HotkeyIdentifier) -> Bool {
-    return enabledStates[identifier] ?? true
+    return enabledStates[identifier] ?? false
   }
 
   func setEnabled(_ enabled: Bool, for identifier: HotkeyIdentifier) {

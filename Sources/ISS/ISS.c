@@ -77,6 +77,12 @@ static unsigned int syntheticEventsToPassThrough = 0;
 // Gesture speed state
 static double gestureSpeed = 2000.0;
 
+// The Cmd+Tab switcher commits when the user releases Cmd after a Tab press
+static const CGKeyCode kTabKeyCode = 48;
+static const CFTimeInterval kCmdTabActivationWindow = 0.5;
+static bool cmdTabPending = false;
+static CFAbsoluteTime cmdTabCommitTime = 0;
+
 static ISSSwitchCallback switchCallback = NULL;
 
 // Predictions dictionary: DisplayID (CFStringRef) -> Index (CFNumberRef)
@@ -185,6 +191,15 @@ static CGEventRef eventTapCallback(CGEventTapProxy proxy, CGEventType type,
         (eventType == kCGSEventDockControl || eventType == kCGSEventGesture)) {
         syntheticEventsToPassThrough--;
         return event;
+    }
+
+    if (type == kCGEventKeyDown && (CGEventGetFlags(event) & kCGEventFlagMaskCommand) &&
+        CGEventGetIntegerValueField(event, kCGKeyboardEventKeycode) == kTabKeyCode) {
+        cmdTabPending = true;
+    } else if (type == kCGEventFlagsChanged && cmdTabPending &&
+               !(CGEventGetFlags(event) & kCGEventFlagMaskCommand)) {
+        cmdTabPending = false;
+        cmdTabCommitTime = CFAbsoluteTimeGetCurrent();
     }
 
     if (!swipeOverrideEnabled) return event;
@@ -694,6 +709,7 @@ bool iss_init(void) {
     }
 
     CGEventMask mask = CGEventMaskBit(kCGEventKeyDown) | CGEventMaskBit(kCGEventKeyUp)
+        | CGEventMaskBit(kCGEventFlagsChanged)
         | (1ULL << kCGSEventGesture) | (1ULL << kCGSEventDockControl);
     globalTap = CGEventTapCreate(
         kCGSessionEventTap,
@@ -857,200 +873,78 @@ void iss_set_switch_callback(ISSSwitchCallback callback) {
     switchCallback = callback;
 }
 
-bool iss_get_space_index_for_pid(pid_t pid, unsigned int currentSpaceIndex, unsigned int *outIndex) {
-    if (!outIndex || !cgs_symbols_available()) {
+bool iss_consume_cmd_tab(void) {
+    bool recent = CFAbsoluteTimeGetCurrent() - cmdTabCommitTime < kCmdTabActivationWindow;
+    cmdTabCommitTime = 0;
+    return recent;
+}
+
+bool iss_switch_to_window_space(uint32_t windowID) {
+    if (&CGSCopySpacesForWindows == NULL || !cgs_symbols_available()) {
         return false;
     }
-    if (&CGSCopySpacesForWindows == NULL) {
-        return false;
-    }
-
-    // Collect CGWindowID values for all normal (layer 0) windows owned by this PID.
-    CFArrayRef allWindowInfo = CGWindowListCopyWindowInfo(
-        kCGWindowListOptionAll | kCGWindowListExcludeDesktopElements,
-        kCGNullWindowID
-    );
-    if (!allWindowInfo) {
-        return false;
-    }
-
-    CFMutableArrayRef windowIDs = CFArrayCreateMutable(NULL, 0, &kCFTypeArrayCallBacks);
-    if (!windowIDs) {
-        CFRelease(allWindowInfo);
-        return false;
-    }
-
-    const CFIndex windowCount = CFArrayGetCount(allWindowInfo);
-    for (CFIndex i = 0; i < windowCount; i++) {
-        CFDictionaryRef winInfo = (CFDictionaryRef)CFArrayGetValueAtIndex(allWindowInfo, i);
-        if (!winInfo || CFGetTypeID(winInfo) != CFDictionaryGetTypeID()) {
-            continue;
-        }
-
-        CFNumberRef ownerPIDNum = (CFNumberRef)CFDictionaryGetValue(winInfo, kCGWindowOwnerPID);
-        if (!ownerPIDNum) {
-            continue;
-        }
-        int32_t windowPID = 0;
-        CFNumberGetValue(ownerPIDNum, kCFNumberSInt32Type, &windowPID);
-        if ((pid_t)windowPID != pid) {
-            continue;
-        }
-
-        // Only consider normal (layer 0) windows to avoid menu-bar / HUD / overlay windows.
-        CFNumberRef layerNum = (CFNumberRef)CFDictionaryGetValue(winInfo, kCGWindowLayer);
-        if (layerNum) {
-            int32_t layer = 0;
-            CFNumberGetValue(layerNum, kCFNumberSInt32Type, &layer);
-            if (layer != 0) {
-                continue;
-            }
-        }
-
-        CFNumberRef windowIDNum = (CFNumberRef)CFDictionaryGetValue(winInfo, kCGWindowNumber);
-        if (windowIDNum) {
-            CFArrayAppendValue(windowIDs, windowIDNum);
-        }
-    }
-    CFRelease(allWindowInfo);
-
-    if (CFArrayGetCount(windowIDs) == 0) {
-        CFRelease(windowIDs);
-        return false;
-    }
-
-    // Build an index->spaceID table from the managed display spaces list so we
-    // can map raw CGS space IDs back to zero-based indices.
     CGSConnectionID connection = CGSMainConnectionID();
 
-    CFStringRef displayIdentifier = NULL;
-    if (&CGSCopyActiveMenuBarDisplayIdentifier != NULL) {
-        displayIdentifier = CGSCopyActiveMenuBarDisplayIdentifier(connection);
-    }
-
-    CFArrayRef displays = CGSCopyManagedDisplaySpaces(connection, displayIdentifier);
-    if (!displays && displayIdentifier) {
-        displays = CGSCopyManagedDisplaySpaces(connection, NULL);
-    }
-    if (!displays) {
-        if (displayIdentifier) CFRelease(displayIdentifier);
-        CFRelease(windowIDs);
-        return false;
-    }
-
-    // Collect the ordered list of space IDs for the active display.
-    // We'll use this to convert a CGS space ID → zero-based index.
-    CFMutableArrayRef orderedSpaceIDs = CFArrayCreateMutable(NULL, 0, NULL);
-    if (!orderedSpaceIDs) {
-        CFRelease(displays);
-        if (displayIdentifier) CFRelease(displayIdentifier);
-        CFRelease(windowIDs);
-        return false;
-    }
-
-    const CFIndex displayCount = CFArrayGetCount(displays);
-    for (CFIndex d = 0; d < displayCount; d++) {
-        CFDictionaryRef displayDict = (CFDictionaryRef)CFArrayGetValueAtIndex(displays, d);
-        if (!displayDict || CFGetTypeID(displayDict) != CFDictionaryGetTypeID()) {
-            continue;
-        }
-
-        // Only process the display identified by displayIdentifier (first display if unset).
-        if (displayIdentifier) {
-            CFStringRef ident = (CFStringRef)CFDictionaryGetValue(displayDict, CFSTR("Display Identifier"));
-            if (!ident || !CFEqual(ident, displayIdentifier)) {
-                continue;
-            }
-        }
-
-        CFArrayRef spaces = (CFArrayRef)CFDictionaryGetValue(displayDict, CFSTR("Spaces"));
-        if (!spaces || CFGetTypeID(spaces) != CFArrayGetTypeID()) {
-            continue;
-        }
-
-        const CFIndex spaceCount = CFArrayGetCount(spaces);
-        for (CFIndex s = 0; s < spaceCount; s++) {
-            CFDictionaryRef spaceDict = (CFDictionaryRef)CFArrayGetValueAtIndex(spaces, s);
-            if (!spaceDict || CFGetTypeID(spaceDict) != CFDictionaryGetTypeID()) {
-                CFArrayAppendValue(orderedSpaceIDs, (void *)(uintptr_t)0);
-                continue;
-            }
-            CFNumberRef spaceIDNum = (CFNumberRef)CFDictionaryGetValue(spaceDict, CFSTR("id64"));
-            int64_t spaceID = 0;
-            if (spaceIDNum && CFGetTypeID(spaceIDNum) == CFNumberGetTypeID()) {
-                CFNumberGetValue(spaceIDNum, kCFNumberSInt64Type, &spaceID);
-            }
-            CFArrayAppendValue(orderedSpaceIDs, (void *)(uintptr_t)(uint64_t)spaceID);
-        }
-        break; // Only need the matching display.
-    }
-
-    CFRelease(displays);
-    if (displayIdentifier) CFRelease(displayIdentifier);
-
-    // Ask CGS which spaces contain the app's windows (mask 7 = all space types).
-    CFArrayRef spacesForWindows = CGSCopySpacesForWindows(connection, 7, windowIDs);
+    CFNumberRef windowNum = CFNumberCreate(NULL, kCFNumberSInt32Type, &windowID);
+    CFArrayRef windowIDs = CFArrayCreate(NULL, (const void **)&windowNum, 1, &kCFTypeArrayCallBacks);
+    CFRelease(windowNum);
+    // Mask 7 = all space types
+    CFArrayRef windowSpaces = CGSCopySpacesForWindows(connection, 7, windowIDs);
     CFRelease(windowIDs);
+    CGSSpaceID windowSpace = 0;
+    if (windowSpaces && CFArrayGetCount(windowSpaces) > 0) {
+        CFNumberGetValue((CFNumberRef)CFArrayGetValueAtIndex(windowSpaces, 0), kCFNumberSInt64Type, &windowSpace);
+    }
+    if (windowSpaces) {
+        CFRelease(windowSpaces);
+    }
 
-    if (!spacesForWindows || CFArrayGetCount(spacesForWindows) == 0) {
-        if (spacesForWindows) CFRelease(spacesForWindows);
-        CFRelease(orderedSpaceIDs);
+    ISSSpaceInfo info;
+    if (windowSpace == 0 || !iss_get_space_info(&info)) {
         return false;
     }
 
-    // Map each returned space ID to an index and decide what to do:
-    //   - If ANY window is already on currentSpaceIndex → app is accessible here, no switch needed.
-    //   - Otherwise, return the first index found on another space.
-    const CFIndex orderedCount = CFArrayGetCount(orderedSpaceIDs);
-    bool foundOnCurrentSpace = false;
-    bool foundOther = false;
-    unsigned int otherIndex = 0;
-
-    const CFIndex winSpaceCount = CFArrayGetCount(spacesForWindows);
-    for (CFIndex ws = 0; ws < winSpaceCount; ws++) {
-        CFTypeRef entry = CFArrayGetValueAtIndex(spacesForWindows, ws);
-        if (!entry || CFGetTypeID(entry) != CFNumberGetTypeID()) {
+    // Find the window's space among the spaces of the display iss_switch_to_index uses
+    CFArrayRef displays = CGSCopyManagedDisplaySpaces(connection, NULL);
+    if (!displays) {
+        return false;
+    }
+    CFStringRef displayID = CFStringCreateWithCString(NULL, info.displayID, kCFStringEncodingUTF8);
+    bool found = false;
+    unsigned int targetIndex = 0;
+    for (CFIndex d = 0; d < CFArrayGetCount(displays) && !found; d++) {
+        CFDictionaryRef display = (CFDictionaryRef)CFArrayGetValueAtIndex(displays, d);
+        if (!display || CFGetTypeID(display) != CFDictionaryGetTypeID()) {
             continue;
         }
-        int64_t winSpaceID = 0;
-        CFNumberGetValue((CFNumberRef)entry, kCFNumberSInt64Type, &winSpaceID);
-        if (winSpaceID == 0) {
+        CFStringRef identifier = (CFStringRef)CFDictionaryGetValue(display, CFSTR("Display Identifier"));
+        CFArrayRef spaces = (CFArrayRef)CFDictionaryGetValue(display, CFSTR("Spaces"));
+        if (!identifier || !CFEqual(identifier, displayID) || !spaces || CFGetTypeID(spaces) != CFArrayGetTypeID()) {
             continue;
         }
-
-        // Find this space ID in our ordered list.
-        for (CFIndex s = 0; s < orderedCount; s++) {
-            int64_t candidate = (int64_t)(uintptr_t)CFArrayGetValueAtIndex(orderedSpaceIDs, s);
-            if (candidate == winSpaceID) {
-                if ((unsigned int)s == currentSpaceIndex) {
-                    foundOnCurrentSpace = true;
-                } else if (!foundOther) {
-                    foundOther = true;
-                    otherIndex = (unsigned int)s;
-                }
+        // Count spaces the same way extract_space_info_from_display does, so indices match
+        unsigned int index = 0;
+        for (CFIndex i = 0; i < CFArrayGetCount(spaces); i++) {
+            CFDictionaryRef space = (CFDictionaryRef)CFArrayGetValueAtIndex(spaces, i);
+            if (!space || CFGetTypeID(space) != CFDictionaryGetTypeID()) {
+                continue;
+            }
+            CFNumberRef idNumber = (CFNumberRef)CFDictionaryGetValue(space, CFSTR("id64"));
+            CGSSpaceID candidate = 0;
+            if (!idNumber || CFGetTypeID(idNumber) != CFNumberGetTypeID() ||
+                !CFNumberGetValue(idNumber, kCFNumberSInt64Type, &candidate)) {
+                continue;
+            }
+            if (candidate == windowSpace) {
+                found = true;
+                targetIndex = index;
                 break;
             }
-        }
-
-        // Early exit: once we know the app has a window on the current space we can stop.
-        if (foundOnCurrentSpace) {
-            break;
+            index++;
         }
     }
+    CFRelease(displayID);
+    CFRelease(displays);
 
-    CFRelease(spacesForWindows);
-    CFRelease(orderedSpaceIDs);
-
-    // If the app has a window on the current space, macOS will focus it without
-    // a space switch — no action needed from us.
-    if (foundOnCurrentSpace) {
-        return false;
-    }
-
-    if (foundOther) {
-        *outIndex = otherIndex;
-        return true;
-    }
-
-    return false;
+    return found && targetIndex != info.currentIndex && iss_switch_to_index(targetIndex);
 }

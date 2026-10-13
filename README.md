@@ -2,6 +2,8 @@
 
 Native instant workspace switching on macOS. No more waiting for animations.
 
+> **This fork makes only Cmd+Tab instant.** When Cmd+Tab picks an app on another space, the switch skips the animation. Swipes, Ctrl+arrow and Dock clicks keep the normal macOS animation. The app's own shortcuts are off and its menu bar icon is hidden by default (open the app again to see its settings). Based on upstream PR [#44](https://github.com/jurplel/InstantSpaceSwitcher/pull/44); see [docs/adr/0001-instant-cmd-tab-only.md](docs/adr/0001-instant-cmd-tab-only.md).
+
 https://github.com/user-attachments/assets/037422c9-3fb7-41cd-8da7-58d28c4c8eff
 
 ## Features

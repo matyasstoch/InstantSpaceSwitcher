@@ -3,7 +3,6 @@
 
 #include <stdbool.h>
 #include <CoreFoundation/CoreFoundation.h>
-#include <sys/types.h>
 
 /** @brief Initialize resources
  * @return true on success, false on failure
@@ -119,15 +118,16 @@ void iss_set_overlay_detection_enabled(bool enabled);
  */
 void iss_set_gesture_speed(double speed);
 
-/*
- * @brief Finds the space index (zero-based) for windows owned by the given process that are NOT
- * on the current space. Returns false if the app already has a window on currentSpaceIndex
- * (meaning no cross-space activation is needed) or if no windows were found.
- * @param pid The process identifier to search for.
- * @param currentSpaceIndex The caller's current zero-based space index.
- * @param outIndex Pointer to receive the target zero-based space index.
- * @return true if a cross-space window was found and outIndex was set.
+/** @brief Returns true once if Cmd+Tab was just committed (Cmd released after Tab)
+ *
+ * Lets an app activation handler tell Cmd+Tab apart from Dock clicks, swipes, etc.
  */
-bool iss_get_space_index_for_pid(pid_t pid, unsigned int currentSpaceIndex, unsigned int *outIndex);
+bool iss_consume_cmd_tab(void);
+
+/** @brief Instantly switch to the space that holds the given window
+ * @param windowID Window server ID of the window
+ * @return true if a switch was started; false if the window is on the current space, on another display, or unknown
+ */
+bool iss_switch_to_window_space(uint32_t windowID);
 
 #endif /* _ISS_H */
